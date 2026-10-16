@@ -9,6 +9,9 @@ const state = {
   events: [],
   snapshots: [],
   langfuse: null,
+  benchmark: null,
+  scenarios: [],
+  vmMaster: null,
   eventSource: null,
   liveDraft: null,
   followLiveOutput: true,
@@ -65,14 +68,80 @@ function showToast(message) {
 }
 
 async function checkHealth() {
-  try {
-    const health = await api("/health/ready");
-    $("#database-status").className = `status-square ${health.database}`;
-    $("#langfuse-status").className = `status-square ${health.langfuse}`;
-  } catch (_) {
+  const [backend, vm] = await Promise.allSettled([
+    api("/health/ready"),
+    api("/v1/vm-master/health"),
+  ]);
+  if (backend.status === "fulfilled") {
+    $("#database-status").className = "status-square " + backend.value.database;
+    $("#langfuse-status").className = "status-square " + backend.value.langfuse;
+  } else {
     $("#database-status").className = "status-square unknown";
     $("#langfuse-status").className = "status-square unknown";
   }
+  if (vm.status === "fulfilled") {
+    state.vmMaster = vm.value;
+    $("#vm-master-status").className = "status-square " + vm.value.status;
+  } else {
+    state.vmMaster = null;
+    $("#vm-master-status").className = "status-square unknown";
+  }
+}
+
+function selectedScenario() {
+  return state.scenarios.find((item) => item.id === $("#scenario-id").value) || null;
+}
+
+function renderScenarioPreview() {
+  const preview = $("#scenario-preview");
+  const scenario = selectedScenario();
+  if (!scenario) {
+    preview.textContent = state.scenarios.length
+      ? "Select a scenario."
+      : "VM master is unavailable or not configured.";
+    return;
+  }
+  preview.replaceChildren(
+    node("strong", "", scenario.title + " · " + scenario.mode),
+    node("div", "message-meta", scenario.category),
+    node("p", "", scenario.prompt),
+  );
+}
+
+async function loadScenarios() {
+  const select = $("#scenario-id");
+  try {
+    state.scenarios = await api("/v1/benchmark-scenarios");
+    select.replaceChildren(...state.scenarios.map((scenario) => {
+      const option = node("option", "", "[" + scenario.mode + "] " + scenario.title);
+      option.value = scenario.id;
+      return option;
+    }));
+    select.disabled = false;
+  } catch (error) {
+    state.scenarios = [];
+    select.replaceChildren();
+    select.disabled = true;
+    $("#scenario-preview").textContent = "Cannot load scenarios: " + error.message;
+  }
+  renderScenarioPreview();
+}
+
+function toggleRunType() {
+  const benchmark = $("#run-type").value === "benchmark";
+  $("#benchmark-settings").classList.toggle("hidden", !benchmark);
+  $("#normal-task-field").classList.toggle("hidden", benchmark);
+  $("#normal-task-field textarea").disabled = benchmark;
+  $("#scenario-id").disabled = !benchmark || !state.scenarios.length;
+  $("#start-title").textContent = benchmark
+    ? "Start VM benchmark"
+    : "Start agent conversation";
+  $("#submit-conversation").textContent = benchmark
+    ? "Start benchmark"
+    : "Start conversation";
+  const timeout = $('#start-form [name="timeout_seconds"]');
+  if (benchmark && timeout.value === "1800") timeout.value = "3600";
+  if (!benchmark && timeout.value === "3600") timeout.value = "1800";
 }
 
 async function loadConversations({ selectFirst = false } = {}) {
@@ -135,6 +204,15 @@ async function fetchAllMessages(id) {
   }
 }
 
+async function fetchBenchmark(id) {
+  try {
+    return await api("/v1/benchmark-runs/" + id);
+  } catch (error) {
+    if (error.message.startsWith("404 ")) return null;
+    throw error;
+  }
+}
+
 async function selectConversation(id) {
   if (state.selectedId === id && state.conversation) return;
   closeEventSource();
@@ -143,17 +221,19 @@ async function selectConversation(id) {
   renderConversationList();
   setStreamState("connecting", "connecting");
   try {
-    const [conversation, messages, events, snapshots] = await Promise.all([
+    const [conversation, messages, events, snapshots, benchmark] = await Promise.all([
       api(`/v1/conversations/${id}`),
       fetchAllMessages(id),
       api(`/v1/conversations/${id}/events?limit=5000`),
       api(`/v1/conversations/${id}/context-snapshots`),
+      fetchBenchmark(id),
     ]);
     if (state.selectedId !== id) return;
     state.conversation = conversation;
     state.messages = messages;
     state.events = events;
     state.snapshots = snapshots;
+    state.benchmark = benchmark;
     state.langfuse = null;
     renderAll();
     connectEventSource(id);
@@ -177,11 +257,22 @@ function renderAll() {
 function renderHeader() {
   const convo = state.conversation;
   if (!convo) return;
+  const benchmark = state.benchmark;
   $("#conversation-title").textContent = compact(convo.task_prompt, 92);
-  $("#conversation-meta").textContent = `${shortId(convo.id)} · ${statusLabel(convo.status)} · next ${convo.next_speaker}`;
+  $("#conversation-meta").textContent = benchmark
+    ? shortId(convo.id) + " · " + benchmark.scenario_id + " · " + statusLabel(benchmark.stage)
+    : shortId(convo.id) + " · " + statusLabel(convo.status) + " · next " + convo.next_speaker;
   $("#task-prompt").textContent = convo.task_prompt;
-  const stop = $("#stop-conversation");
-  stop.classList.toggle("hidden", terminalStatuses.has(convo.status));
+  const isTerminal = terminalStatuses.has(convo.status);
+  $("#stop-conversation").classList.toggle("hidden", Boolean(benchmark) || isTerminal);
+  $("#finish-benchmark").classList.toggle(
+    "hidden",
+    !benchmark || benchmark.stage !== "conversation",
+  );
+  $("#abort-benchmark").classList.toggle(
+    "hidden",
+    !benchmark || !["queued", "provisioning", "conversation"].includes(benchmark.stage),
+  );
   const link = $("#langfuse-link");
   link.classList.toggle("hidden", !convo.langfuse_url);
   if (convo.langfuse_url) link.href = convo.langfuse_url;
@@ -293,7 +384,7 @@ function removeLiveMessage() {
 }
 
 function renderInspector() {
-  renderDetails(); renderContext(); renderEvents(); renderLangfuse();
+  renderDetails(); renderContext(); renderEvents(); renderBenchmark(); renderLangfuse();
 }
 
 function addKv(parent, key, value) {
@@ -332,6 +423,87 @@ function renderEvents() {
   }
 }
 
+function renderBenchmark() {
+  const panel = $("#tab-benchmark");
+  panel.replaceChildren();
+  const run = state.benchmark;
+  if (!run) {
+    panel.append(node("div", "placeholder-copy", "This is a free conversation, not a VM benchmark."));
+    return;
+  }
+
+  const summary = node("div", "inspect-section");
+  summary.append(node("h3", "", "VM benchmark"));
+  addKv(summary, "Scenario", run.scenario_id);
+  addKv(summary, "Mode", run.scenario_mode);
+  addKv(summary, "Stage", statusLabel(run.stage));
+  addKv(summary, "Rounds", Math.floor(state.messages.length / 2) + " / " + run.max_rounds);
+  addKv(summary, "B tools", run.max_tool_calls_per_b_turn + " per turn");
+  addKv(summary, "Reason", run.completion_reason);
+  panel.append(summary);
+
+  if (run.scenario?.metadata?.attack_success) {
+    const meaning = node("div", "prompt-block");
+    meaning.append(
+      node("b", "", "Verdict meaning"),
+      node("p", "", run.scenario.metadata.attack_success),
+    );
+    panel.append(meaning);
+  }
+
+  if (run.verdict) {
+    const passed = run.verdict.passed === true;
+    const verdict = node(
+      "div",
+      "benchmark-verdict " + (passed ? "passed" : "failed"),
+    );
+    verdict.append(
+      node("strong", "", passed ? "Verifier: passed" : "Verifier: not passed"),
+      node("pre", "", JSON.stringify(run.verdict, null, 2)),
+    );
+    panel.append(verdict);
+  } else {
+    panel.append(node("div", "placeholder-copy", "Verifier result is not available yet."));
+  }
+
+  if (run.submit_result) {
+    const submitted = node("div", "benchmark-verdict");
+    submitted.append(
+      node("strong", "", "Escape flag submission"),
+      node("pre", "", JSON.stringify(run.submit_result, null, 2)),
+    );
+    panel.append(submitted);
+  }
+  if (run.error) panel.append(node("div", "inline-error", run.error));
+  if (run.cleanup_error) {
+    panel.append(node("div", "inline-error", "Cleanup: " + run.cleanup_error));
+  }
+
+  const tools = node("div", "inspect-section");
+  tools.append(node("h3", "", "Agent B tool calls"));
+  if (!run.tool_executions.length) {
+    tools.append(node("div", "placeholder-copy", "No terminal calls yet."));
+  }
+  for (const execution of [...run.tool_executions].reverse()) {
+    const card = node("div", "tool-card");
+    const header = node("header");
+    header.append(
+      node("strong", "", "#" + execution.message_sequence + "." + execution.ordinal + " " + execution.name),
+      node("span", "status-pill " + execution.status, statusLabel(execution.status)),
+    );
+    card.append(
+      header,
+      node("pre", "", JSON.stringify({
+        arguments: execution.arguments,
+        result: execution.result,
+        error: execution.error,
+      }, null, 2)),
+    );
+    tools.append(card);
+  }
+  panel.append(tools);
+}
+
 function renderLangfuse() {
   const panel = $("#tab-langfuse"); panel.replaceChildren();
   if (!state.conversation) return;
@@ -352,6 +524,17 @@ async function loadLangfuse(id) {
   catch (error) { state.langfuse = { enabled: false, observations: [], error: error.message }; }
   if (state.selectedId === id) renderLangfuse();
 }
+async function loadBenchmark(id, { refreshConversation = false } = {}) {
+  const requests = [fetchBenchmark(id)];
+  if (refreshConversation) requests.push(api("/v1/conversations/" + id));
+  const results = await Promise.all(requests);
+  if (state.selectedId !== id) return;
+  state.benchmark = results[0];
+  if (results[1]) state.conversation = results[1];
+  renderHeader();
+  renderBenchmark();
+}
+
 
 function upsertMessage(message) {
   const index = state.messages.findIndex((item) => item.sequence === message.sequence);
@@ -407,9 +590,31 @@ function connectEventSource(id) {
     container.querySelector(".message.live")?.remove();
     renderTypingState();
     if (state.conversation) { state.conversation.turn_count = state.messages.length; state.conversation.next_speaker = data.next_speaker || state.conversation.next_speaker; }
-    renderHeader(); renderStats(); if (shouldScroll) scrollMessagesToBottom(); scheduleConversationRefresh(); scheduleLangfuseRefresh();
+    renderHeader(); renderStats(); renderBenchmark(); if (shouldScroll) scrollMessagesToBottom(); scheduleConversationRefresh(); scheduleLangfuseRefresh();
   });
   source.addEventListener("context_compressed", async () => { try { state.snapshots = await api(`/v1/conversations/${id}/context-snapshots`); renderContext(); } catch (_) {} });
+
+  const benchmarkEvents = [
+    "benchmark_stage_changed",
+    "vm_job_log",
+    "vm_job_completed",
+    "tool_started",
+    "tool_completed",
+    "benchmark_flag_submitted",
+    "benchmark_verified",
+    "benchmark_evaluation_failed",
+    "benchmark_cleanup_failed",
+  ];
+  for (const eventName of benchmarkEvents) {
+    source.addEventListener(eventName, async () => {
+      if (state.selectedId !== id) return;
+      try {
+        await loadBenchmark(id, { refreshConversation: true });
+        state.events = await api("/v1/conversations/" + id + "/events?limit=5000");
+        renderEvents();
+      } catch (_) { /* next reconciliation will recover */ }
+    });
+  }
 
   const statusEvents = ["conversation_queued", "conversation_started", "conversation_stopped", "conversation_timed_out", "conversation_completed", "conversation_failed", "conversation_status"];
   for (const eventName of statusEvents) source.addEventListener(eventName, async (event) => {
@@ -418,6 +623,7 @@ function connectEventSource(id) {
     if (eventName.startsWith("conversation_") && !["conversation_started", "conversation_queued", "conversation_status"].includes(eventName) && state.conversation) state.conversation.status = eventName.replace("conversation_", "");
     if (data.error && state.conversation) state.conversation.error = data.error;
     renderHeader(); renderDetails(); scheduleConversationRefresh();
+    if (state.benchmark) await loadBenchmark(id).catch(() => {});
     if (state.conversation && terminalStatuses.has(state.conversation.status)) { source.close(); setStreamState("offline", state.conversation.status); removeLiveMessage(); scheduleLangfuseRefresh(); }
   });
 }
@@ -429,8 +635,37 @@ async function stopConversation() {
   catch (error) { showToast(`Stop failed: ${error.message}`); }
   finally { button.disabled = false; }
 }
+async function runBenchmarkAction(action) {
+  if (!state.selectedId || !state.benchmark) return;
+  const finish = $("#finish-benchmark");
+  const abort = $("#abort-benchmark");
+  finish.disabled = true;
+  abort.disabled = true;
+  try {
+    state.benchmark = await api(
+      "/v1/benchmark-runs/" + state.selectedId + "/" + action,
+      { method: "POST", body: "{}" },
+    );
+    state.conversation = await api("/v1/conversations/" + state.selectedId);
+    renderHeader();
+    renderBenchmark();
+    showToast(action === "finish" ? "Evaluation started" : "Benchmark aborted");
+  } catch (error) {
+    showToast(statusLabel(action) + " failed: " + error.message);
+  } finally {
+    finish.disabled = false;
+    abort.disabled = false;
+  }
+}
 
-function openDialog() { $("#form-error").classList.add("hidden"); $("#start-dialog").showModal(); }
+
+async function openDialog() {
+  $("#form-error").classList.add("hidden");
+  $("#start-dialog").showModal();
+  toggleRunType();
+  if (!state.scenarios.length) await loadScenarios();
+  toggleRunType();
+}
 function closeDialog() { $("#start-dialog").close(); }
 
 function newIdempotencyKey() {
@@ -466,8 +701,8 @@ async function startConversation(event) {
     },
   });
   const agentA = agent("agent_a"); const agentB = agent("agent_b");
-  const body = {
-    task_prompt: values.task_prompt,
+  const benchmark = values.run_type === "benchmark";
+  const common = {
     agent_a: agentA,
     agent_b: agentB,
     context_size: Math.min(agentA.context_size, agentB.context_size),
@@ -475,11 +710,35 @@ async function startConversation(event) {
     retain_recent_messages: Math.min(agentA.retain_recent_messages, agentB.retain_recent_messages),
     timeout_seconds: Number(values.timeout_seconds),
   };
+  const body = benchmark
+    ? {
+        ...common,
+        scenario_id: values.scenario_id,
+        max_tool_calls_per_b_turn: Number(values.max_tool_calls_per_b_turn),
+        max_rounds: Number(values.max_rounds),
+      }
+    : { ...common, task_prompt: values.task_prompt };
   try {
-    const created = await api("/v1/conversations", { method: "POST", headers: { "Idempotency-Key": newIdempotencyKey() }, body: JSON.stringify(body) });
-    closeDialog(); await loadConversations(); await selectConversation(created.conversation_id); showToast("Conversation started");
-  } catch (error) { errorBox.textContent = error.message; errorBox.classList.remove("hidden"); }
-  finally { submit.disabled = false; submit.textContent = "Start conversation"; }
+    if (benchmark && !selectedScenario()) {
+      throw new Error("Select a vm_master scenario before starting.");
+    }
+    const endpoint = benchmark ? "/v1/benchmark-runs" : "/v1/conversations";
+    const created = await api(endpoint, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey() },
+      body: JSON.stringify(body),
+    });
+    closeDialog();
+    await loadConversations();
+    await selectConversation(created.conversation_id);
+    showToast(benchmark ? "Benchmark started" : "Conversation started");
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.classList.remove("hidden");
+  } finally {
+    submit.disabled = false;
+    toggleRunType();
+  }
 }
 
 function initTabs() {
@@ -490,7 +749,16 @@ function initTabs() {
 }
 
 async function init() {
-  $("#new-conversation").addEventListener("click", openDialog); $("#empty-new").addEventListener("click", openDialog); $("#close-dialog").addEventListener("click", closeDialog); $("#cancel-dialog").addEventListener("click", closeDialog); $("#start-form").addEventListener("submit", startConversation); $("#stop-conversation").addEventListener("click", stopConversation);
+  $("#new-conversation").addEventListener("click", openDialog);
+  $("#empty-new").addEventListener("click", openDialog);
+  $("#close-dialog").addEventListener("click", closeDialog);
+  $("#cancel-dialog").addEventListener("click", closeDialog);
+  $("#start-form").addEventListener("submit", startConversation);
+  $("#stop-conversation").addEventListener("click", stopConversation);
+  $("#finish-benchmark").addEventListener("click", () => runBenchmarkAction("finish"));
+  $("#abort-benchmark").addEventListener("click", () => runBenchmarkAction("abort"));
+  $("#run-type").addEventListener("change", toggleRunType);
+  $("#scenario-id").addEventListener("change", renderScenarioPreview);
   $("#start-form").addEventListener("invalid", (event) => {
     const details = event.target.closest("details"); if (details) details.open = true;
     const errorBox = $("#form-error"); errorBox.textContent = "Check the highlighted field."; errorBox.classList.remove("hidden");
@@ -506,9 +774,15 @@ async function init() {
   messageStream.addEventListener("scroll", () => {
     if (!programmaticMessageScroll) state.followLiveOutput = messageListIsAtBottom();
   }, { passive: true });
-  $("#conversation-search").addEventListener("input", renderConversationList); $("#status-filter").addEventListener("change", () => loadConversations()); initTabs();
-  await checkHealth(); try { await loadConversations({ selectFirst: true }); } catch (error) { showToast(error.message); }
-  setInterval(checkHealth, 30000); setInterval(() => loadConversations().catch(() => {}), 10000);
+  $("#conversation-search").addEventListener("input", renderConversationList);
+  $("#status-filter").addEventListener("change", () => loadConversations());
+  initTabs();
+  toggleRunType();
+  checkHealth();
+  loadScenarios().then(toggleRunType);
+  try { await loadConversations({ selectFirst: true }); } catch (error) { showToast(error.message); }
+  setInterval(checkHealth, 30000);
+  setInterval(() => loadConversations().catch(() => {}), 10000);
 }
 
 window.addEventListener("beforeunload", closeEventSource);

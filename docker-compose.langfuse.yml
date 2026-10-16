@@ -55,7 +55,7 @@ services:
     ports:
       - 127.0.0.1:${LANGFUSE_WORKER_PORT:-3030}:3030
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3030/api/health"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$${HOSTNAME}:3030/api/health"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -83,7 +83,7 @@ services:
     ports:
       - 127.0.0.1:${LANGFUSE_PORT:-3000}:3000
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):3000/api/public/health?failIfDatabaseUnavailable=true"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$${HOSTNAME}:3000/api/public/health?failIfDatabaseUnavailable=true"]
       interval: 30s
       timeout: 10s
       retries: 5

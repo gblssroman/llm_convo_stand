@@ -10,9 +10,10 @@ async def test_broker_fans_out_transient_token_events() -> None:
     broker = RealtimeBroker()
     conversation_id = uuid.uuid4()
 
-    async with broker.subscribe(conversation_id) as first, broker.subscribe(
-        conversation_id
-    ) as second:
+    async with (
+        broker.subscribe(conversation_id) as first,
+        broker.subscribe(conversation_id) as second,
+    ):
         await broker.publish(
             conversation_id,
             "turn_delta",

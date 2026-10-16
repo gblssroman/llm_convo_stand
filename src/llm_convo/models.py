@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -37,6 +38,8 @@ class ConversationStatus(StrEnum):
     timed_out = "timed_out"
     completed = "completed"
     failed = "failed"
+    evaluating = "evaluating"
+    cleaning_up = "cleaning_up"
 
 
 TERMINAL_STATUSES = {
@@ -158,3 +161,53 @@ class ConversationEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="events")
+
+
+class BenchmarkRun(Base):
+    __tablename__ = "benchmark_runs"
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(64), index=True)
+    scenario_mode: Mapped[str] = mapped_column(String(16))
+    scenario: Mapped[dict[str, Any]] = mapped_column(JSON)
+    stage: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    max_tool_calls_per_b_turn: Mapped[int] = mapped_column(Integer)
+    max_rounds: Mapped[int] = mapped_column(Integer)
+    cleanup_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    completion_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    final_conversation_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    flag_candidate: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verdict: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    submit_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleanup_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ToolExecution(Base):
+    __tablename__ = "tool_executions"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id", "message_sequence", "tool_call_id", name="uq_tool_call"
+        ),
+        Index("ix_tool_execution_conversation_created", "conversation_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    message_sequence: Mapped[int] = mapped_column(Integer)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    tool_call_id: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(64))
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

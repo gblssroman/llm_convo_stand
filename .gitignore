@@ -4,6 +4,7 @@ __pycache__/
 .coverage
 .env
 .env.langfuse
+.env.vm-master
 .pytest_cache/
 .ruff_cache/
 .venv/

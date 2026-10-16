@@ -11,8 +11,10 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import text
 
+from llm_convo.benchmark import BenchmarkCoordinator, BenchmarkService
 from llm_convo.config import Settings, get_settings
 from llm_convo.db import create_engine, create_session_factory, init_database
 from llm_convo.llm import OpenAICompatibleClient
@@ -21,6 +23,7 @@ from llm_convo.models import Conversation, ConversationStatus
 from llm_convo.realtime import RealtimeBroker, RealtimeEvent
 from llm_convo.runner import ConversationRunner
 from llm_convo.schemas import (
+    BenchmarkRunView,
     ConversationCreated,
     ConversationPage,
     ConversationSummary,
@@ -32,10 +35,20 @@ from llm_convo.schemas import (
     MessagePage,
     MessageView,
     SnapshotView,
+    StartBenchmarkRequest,
     StartConversationRequest,
+    ToolExecutionView,
+    VmMasterHealthResponse,
+    VmScenario,
 )
 from llm_convo.service import ConversationService, IdempotencyConflictError
 from llm_convo.tracing import Tracing
+from llm_convo.vm_master import (
+    VmMasterBusyError,
+    VmMasterClient,
+    VmMasterError,
+    VmMasterNotConfiguredError,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -66,6 +79,20 @@ def _conversation_summary(conversation: Conversation) -> ConversationSummary:
     )
 
 
+def _benchmark_view(run: Any, tools: list[Any]) -> BenchmarkRunView:
+    return BenchmarkRunView.model_validate(run).model_copy(
+        update={"tool_executions": [ToolExecutionView.model_validate(item) for item in tools]}
+    )
+
+
+def _vm_http_exception(exc: VmMasterError) -> HTTPException:
+    if isinstance(exc, VmMasterNotConfiguredError):
+        return HTTPException(status_code=503, detail=str(exc))
+    if isinstance(exc, VmMasterBusyError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=502, detail=str(exc))
+
+
 def _sse(event: str, data: dict[str, Any], event_id: str | None = None) -> str:
     payload = json.dumps(jsonable_encoder(data), ensure_ascii=False, separators=(",", ":"))
     id_line = f"id: {event_id}\n" if event_id else ""
@@ -92,11 +119,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     realtime = RealtimeBroker()
     service = ConversationService(sessions)
+    vm_master = VmMasterClient(
+        base_url=settings.vm_master_base_url,
+        evaluator_token=settings.vm_master_evaluator_token,
+        sandbox_token=settings.vm_master_sandbox_token,
+        request_timeout_seconds=settings.vm_master_request_timeout_seconds,
+        job_poll_seconds=settings.vm_master_job_poll_seconds,
+        job_timeout_seconds=settings.vm_master_job_timeout_seconds,
+    )
+    benchmark_service = BenchmarkService(sessions)
+    benchmark_coordinator = BenchmarkCoordinator(sessions, vm_master, realtime)
     runner = ConversationRunner(
         sessions,
         llm,
         tracing,
         realtime,
+        benchmark_coordinator,
         poll_seconds=settings.worker_poll_seconds,
         lease_seconds=settings.worker_lease_seconds,
         heartbeat_seconds=settings.worker_heartbeat_seconds,
@@ -111,6 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         yield
         await runner.shutdown(settings.shutdown_grace_seconds)
         await llm.close()
+        await vm_master.close()
         tracing.shutdown()
         await engine.dispose()
 
@@ -125,6 +164,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.runner = runner
     app.state.tracing = tracing
     app.state.realtime = realtime
+    app.state.vm_master = vm_master
+    app.state.benchmark_service = benchmark_service
+    app.state.benchmark_coordinator = benchmark_coordinator
 
     app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
@@ -176,12 +218,147 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         include_in_schema=False,
     )(start_conversation)
 
+    async def supported_scenario(request: Request, scenario_id: str) -> VmScenario:
+        if scenario_id == "memory-poisoning":
+            raise HTTPException(
+                status_code=422,
+                detail="memory-poisoning is not supported by the conversation integration",
+            )
+        try:
+            return await request.app.state.vm_master.get_scenario(scenario_id)
+        except VmMasterError as exc:
+            raise _vm_http_exception(exc) from exc
+
+    @app.get("/v1/vm-master/health", response_model=VmMasterHealthResponse)
+    async def vm_master_health(request: Request) -> VmMasterHealthResponse:
+        client: VmMasterClient = request.app.state.vm_master
+        if not client.configured:
+            return VmMasterHealthResponse(configured=False, status="disabled")
+        try:
+            await client.health()
+        except VmMasterError as exc:
+            return VmMasterHealthResponse(configured=True, status="error", error=str(exc))
+        return VmMasterHealthResponse(configured=True, status="ok")
+
+    @app.get("/v1/benchmark-scenarios", response_model=list[VmScenario])
+    async def list_benchmark_scenarios(request: Request) -> list[VmScenario]:
+        try:
+            summaries = await request.app.state.vm_master.list_scenarios()
+            scenarios = [
+                await request.app.state.vm_master.get_scenario(item.id)
+                for item in summaries
+                if item.id != "memory-poisoning"
+            ]
+        except VmMasterError as exc:
+            raise _vm_http_exception(exc) from exc
+        return scenarios
+
+    @app.get("/v1/benchmark-scenarios/{scenario_id}", response_model=VmScenario)
+    async def get_benchmark_scenario(scenario_id: str, request: Request) -> VmScenario:
+        return await supported_scenario(request, scenario_id)
+
+    @app.post(
+        "/v1/benchmark-runs",
+        response_model=ConversationCreated,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_benchmark(
+        body: StartBenchmarkRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> ConversationCreated:
+        if not idempotency_key or not idempotency_key.strip():
+            raise HTTPException(
+                status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+                detail="Idempotency-Key header is required",
+            )
+        if len(idempotency_key) > 255:
+            raise HTTPException(status_code=400, detail="Idempotency-Key is too long")
+        scenario = await supported_scenario(request, body.scenario_id)
+        try:
+            result = await request.app.state.benchmark_service.create(
+                body, scenario, idempotency_key.strip()
+            )
+        except IdempotencyConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PydanticValidationError as exc:
+            raise HTTPException(status_code=422, detail=jsonable_encoder(exc.errors())) from exc
+        request.app.state.runner.enqueue(result.conversation.id)
+        if not result.deduplicated:
+            await request.app.state.realtime.publish(
+                result.conversation.id,
+                "conversation_queued",
+                {
+                    "status": result.conversation.status,
+                    "benchmark": True,
+                    "scenario_id": scenario.id,
+                },
+            )
+        return ConversationCreated(
+            conversation_id=result.conversation.id,
+            status=result.conversation.status,
+            deduplicated=result.deduplicated,
+        )
+
+    @app.get(
+        "/v1/benchmark-runs/{conversation_id}",
+        response_model=BenchmarkRunView,
+    )
+    async def get_benchmark_run(conversation_id: uuid.UUID, request: Request) -> BenchmarkRunView:
+        found = await request.app.state.benchmark_service.get(conversation_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found")
+        run, tools = found
+        return _benchmark_view(run, tools)
+
+    @app.post(
+        "/v1/benchmark-runs/{conversation_id}/finish",
+        response_model=BenchmarkRunView,
+    )
+    async def finish_benchmark_run(
+        conversation_id: uuid.UUID, request: Request
+    ) -> BenchmarkRunView:
+        started = await request.app.state.benchmark_coordinator.begin_evaluation(
+            conversation_id, reason="manual"
+        )
+        if not started:
+            raise HTTPException(
+                status_code=409,
+                detail="Benchmark can be evaluated only while the conversation is active",
+            )
+        if not request.app.state.runner.cancel(conversation_id):
+            await request.app.state.benchmark_coordinator.finalize(conversation_id)
+        found = await request.app.state.benchmark_service.get(conversation_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found")
+        return _benchmark_view(*found)
+
+    @app.post(
+        "/v1/benchmark-runs/{conversation_id}/abort",
+        response_model=BenchmarkRunView,
+    )
+    async def abort_benchmark_run(conversation_id: uuid.UUID, request: Request) -> BenchmarkRunView:
+        existing = await request.app.state.benchmark_service.run(conversation_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found")
+        if existing.stage in {"evaluating", "cleaning_up"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Evaluation or cleanup is already in progress",
+            )
+        if existing.stage not in {"completed", "failed", "aborted", "cleanup_failed"}:
+            await request.app.state.benchmark_coordinator.request_abort(conversation_id)
+            if not request.app.state.runner.cancel(conversation_id):
+                await request.app.state.benchmark_coordinator.finalize(conversation_id)
+        found = await request.app.state.benchmark_service.get(conversation_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Benchmark run not found")
+        return _benchmark_view(*found)
+
     @app.get("/v1/conversations", response_model=ConversationPage)
     async def list_conversations(
         request: Request,
-        conversation_status: Annotated[
-            ConversationStatus | None, Query(alias="status")
-        ] = None,
+        conversation_status: Annotated[ConversationStatus | None, Query(alias="status")] = None,
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ) -> ConversationPage:
@@ -205,6 +382,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def end_conversation(
         conversation_id: uuid.UUID, request: Request
     ) -> EndConversationResponse:
+        benchmark_run = await request.app.state.benchmark_service.run(conversation_id)
+        if benchmark_run is not None:
+            if benchmark_run.stage in {"evaluating", "cleaning_up"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Evaluation or cleanup is already in progress",
+                )
+            if benchmark_run.stage not in {
+                "completed",
+                "failed",
+                "aborted",
+                "cleanup_failed",
+            }:
+                await request.app.state.benchmark_coordinator.request_abort(conversation_id)
+                if not request.app.state.runner.cancel(conversation_id):
+                    await request.app.state.benchmark_coordinator.finalize(conversation_id)
+            current = await request.app.state.service.get(conversation_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            return EndConversationResponse(
+                conversation_id=conversation_id,
+                status=current.status,
+            )
         conversation = await request.app.state.service.request_stop(conversation_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -239,9 +439,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         after_sequence: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> MessagePage:
-        items = await request.app.state.service.messages(
-            conversation_id, after_sequence, limit
-        )
+        items = await request.app.state.service.messages(conversation_id, after_sequence, limit)
         if items is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return MessagePage(
@@ -264,9 +462,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/v1/conversations/{conversation_id}/context-snapshots",
         response_model=list[SnapshotView],
     )
-    async def get_snapshots(
-        conversation_id: uuid.UUID, request: Request
-    ) -> list[SnapshotView]:
+    async def get_snapshots(conversation_id: uuid.UUID, request: Request) -> list[SnapshotView]:
         items = await request.app.state.service.snapshots(conversation_id)
         if items is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -447,11 +643,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database_status = "error"
         langfuse_status = await request.app.state.tracing.health()
         return HealthResponse(
-            status=(
-                "ok"
-                if database_status == "ok" and langfuse_status != "error"
-                else "degraded"
-            ),
+            status=("ok" if database_status == "ok" and langfuse_status != "error" else "degraded"),
             database=database_status,
             langfuse=langfuse_status,
         )

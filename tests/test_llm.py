@@ -84,9 +84,7 @@ async def test_auto_mode_falls_back_when_stream_is_unsupported() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = OpenAICompatibleClient(http)
-    result = await client.complete(
-        config=config(), messages=[{"role": "user", "content": "hi"}]
-    )
+    result = await client.complete(config=config(), messages=[{"role": "user", "content": "hi"}])
 
     assert calls == [True, True, False]
     assert result.content == "fallback"
@@ -94,9 +92,7 @@ async def test_auto_mode_falls_back_when_stream_is_unsupported() -> None:
     assert result.attempts == 3
 
     # Capability is cached, so later turns skip known-bad SSE requests.
-    second = await client.complete(
-        config=config(), messages=[{"role": "user", "content": "again"}]
-    )
+    second = await client.complete(config=config(), messages=[{"role": "user", "content": "again"}])
     assert calls == [True, True, False, False]
     assert second.attempts == 1
     await http.aclose()
@@ -119,12 +115,8 @@ async def test_streaming_retries_without_optional_usage_extension() -> None:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = OpenAICompatibleClient(http)
-    first = await client.complete(
-        config=config(), messages=[{"role": "user", "content": "hi"}]
-    )
-    second = await client.complete(
-        config=config(), messages=[{"role": "user", "content": "again"}]
-    )
+    first = await client.complete(config=config(), messages=[{"role": "user", "content": "hi"}])
+    second = await client.complete(config=config(), messages=[{"role": "user", "content": "again"}])
 
     assert first.streamed is True
     assert first.attempts == 2

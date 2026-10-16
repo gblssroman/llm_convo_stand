@@ -32,6 +32,13 @@ class StreamUnsupportedError(LLMError):
 
 
 @dataclass(slots=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True)
 class LLMResult:
     content: str
     prompt_tokens: int | None
@@ -43,6 +50,7 @@ class LLMResult:
     streamed: bool
     attempts: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 def _api_key(config: AgentConfig) -> str | None:
@@ -78,6 +86,35 @@ def _raise_for_status(response: httpx.Response, *, streaming: bool) -> None:
     raise LLMError(message)
 
 
+def _parse_tool_calls(value: Any) -> list[ToolCall]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise LLMError("LLM endpoint returned malformed tool calls")
+    result: list[ToolCall] = []
+    for item in value:
+        try:
+            function = item["function"]
+            call_id = item["id"]
+            name = function["name"]
+            raw_arguments = function.get("arguments") or "{}"
+            arguments = (
+                json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise LLMError("LLM endpoint returned malformed tool call arguments") from exc
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(arguments, dict)
+        ):
+            raise LLMError("LLM endpoint returned malformed tool call")
+        result.append(ToolCall(id=call_id, name=name, arguments=arguments))
+    return result
+
+
 class OpenAICompatibleClient:
     def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._client = client or httpx.AsyncClient()
@@ -93,10 +130,12 @@ class OpenAICompatibleClient:
         self,
         *,
         config: AgentConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         parameter_overrides: dict[str, Any] | None = None,
         on_stream_start: AsyncCallback | None = None,
         on_token: TokenCallback | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResult:
         parameters = config.parameters.to_openai_payload()
         if parameter_overrides:
@@ -107,11 +146,13 @@ class OpenAICompatibleClient:
             **parameters,
             **config.extra_body,
         }
+        if tools:
+            base_payload["tools"] = tools
+            base_payload["tool_choice"] = tool_choice or "auto"
 
         capability_key = (str(config.base_url), config.model)
         use_stream = config.stream is not StreamMode.never and (
-            config.stream is StreamMode.always
-            or self._stream_capability.get(capability_key, True)
+            config.stream is StreamMode.always or self._stream_capability.get(capability_key, True)
         )
         include_usage = self._stream_usage_capability.get(capability_key, True)
         last_error: Exception | None = None
@@ -219,9 +260,7 @@ class OpenAICompatibleClient:
         )
         return await self._non_stream(config, base_payload)
 
-    async def _non_stream(
-        self, config: AgentConfig, base_payload: dict[str, Any]
-    ) -> LLMResult:
+    async def _non_stream(self, config: AgentConfig, base_payload: dict[str, Any]) -> LLMResult:
         started = time.perf_counter()
         response = await self._client.post(
             f"{str(config.base_url).rstrip('/')}/chat/completions",
@@ -233,11 +272,15 @@ class OpenAICompatibleClient:
         try:
             data = response.json()
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            message = choice["message"]
+            content = message.get("content") or ""
+            tool_calls = _parse_tool_calls(message.get("tool_calls"))
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise LLMError("Malformed non-streaming response from LLM endpoint") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise LLMError("LLM endpoint returned an empty text completion")
+        if not isinstance(content, str):
+            raise LLMError("LLM endpoint returned malformed message content")
+        if not content.strip() and not tool_calls:
+            raise LLMError("LLM endpoint returned neither text nor tool calls")
         usage = data.get("usage") or {}
         elapsed = int((time.perf_counter() - started) * 1000)
         return LLMResult(
@@ -251,6 +294,7 @@ class OpenAICompatibleClient:
             streamed=False,
             attempts=1,
             metadata={"response_id": data.get("id"), "created": data.get("created")},
+            tool_calls=tool_calls,
         )
 
     async def _stream(
@@ -265,6 +309,7 @@ class OpenAICompatibleClient:
         started = time.perf_counter()
         first_token_ms: int | None = None
         chunks: list[str] = []
+        tool_fragments: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] = {}
         finish_reason: str | None = None
         response_id: str | None = None
@@ -309,6 +354,26 @@ class OpenAICompatibleClient:
                     continue
                 choice = choices[0]
                 delta = choice.get("delta") or {}
+                for fragment in delta.get("tool_calls") or []:
+                    if not isinstance(fragment, dict):
+                        raise LLMError("Malformed streaming tool call")
+                    try:
+                        index = int(fragment.get("index", 0))
+                    except (TypeError, ValueError) as exc:
+                        raise LLMError("Malformed streaming tool call index") from exc
+                    current = tool_fragments.setdefault(
+                        index,
+                        {"id": "", "function": {"name": "", "arguments": ""}},
+                    )
+                    if fragment.get("id"):
+                        current["id"] = fragment["id"]
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        current["function"]["name"] += function["name"]
+                    if function.get("arguments"):
+                        current["function"]["arguments"] += function["arguments"]
+                    if first_token_ms is None:
+                        first_token_ms = int((time.perf_counter() - started) * 1000)
                 content = delta.get("content")
                 if content:
                     if first_token_ms is None:
@@ -327,8 +392,10 @@ class OpenAICompatibleClient:
                 finish_reason = choice.get("finish_reason") or finish_reason
 
         elapsed = int((time.perf_counter() - started) * 1000)
-        if not chunks:
-            raise LLMError("Streaming response ended without a text completion")
+        raw_tool_calls = [tool_fragments[index] for index in sorted(tool_fragments)]
+        tool_calls = _parse_tool_calls(raw_tool_calls)
+        if not chunks and not tool_calls:
+            raise LLMError("Streaming response ended without text or tool calls")
         return LLMResult(
             content="".join(chunks),
             prompt_tokens=usage.get("prompt_tokens"),
@@ -340,4 +407,5 @@ class OpenAICompatibleClient:
             streamed=True,
             attempts=1,
             metadata={"response_id": response_id},
+            tool_calls=tool_calls,
         )

@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from llm_convo.benchmark import BenchmarkCoordinator
 from llm_convo.context import (
     WorkingContext,
     build_compression_messages,
@@ -15,7 +16,7 @@ from llm_convo.context import (
     estimate_tokens,
     needs_compression,
 )
-from llm_convo.llm import LLMResult, OpenAICompatibleClient
+from llm_convo.llm import LLMResult, OpenAICompatibleClient, ToolCall
 from llm_convo.logging import log_event
 from llm_convo.models import (
     ContextSnapshot,
@@ -26,6 +27,7 @@ from llm_convo.models import (
     as_utc,
     utc_now,
 )
+from llm_convo.react import AgentBReactGraph
 from llm_convo.realtime import RealtimeBroker
 from llm_convo.schemas import AgentConfig
 from llm_convo.tracing import Tracing
@@ -44,6 +46,7 @@ class ConversationRunner:
         llm: OpenAICompatibleClient,
         tracing: Tracing,
         realtime: RealtimeBroker | None = None,
+        benchmark: BenchmarkCoordinator | None = None,
         *,
         poll_seconds: float = 2.0,
         lease_seconds: int = 180,
@@ -54,6 +57,7 @@ class ConversationRunner:
         self._llm = llm
         self._tracing = tracing
         self._realtime = realtime or RealtimeBroker()
+        self._benchmark = benchmark
         self._poll_seconds = poll_seconds
         self._lease_seconds = lease_seconds
         self._heartbeat_seconds = min(heartbeat_seconds, max(5, lease_seconds // 3))
@@ -76,10 +80,12 @@ class ConversationRunner:
         self._tasks[conversation_id] = task
         task.add_done_callback(lambda _: self._tasks.pop(conversation_id, None))
 
-    def cancel(self, conversation_id: uuid.UUID) -> None:
+    def cancel(self, conversation_id: uuid.UUID) -> bool:
         task = self._tasks.get(conversation_id)
         if task and not task.done():
             task.cancel()
+            return True
+        return False
 
     async def shutdown(self, grace_seconds: float = 10.0) -> None:
         self._closing = True
@@ -128,6 +134,9 @@ class ConversationRunner:
             )
             for conversation_id in result:
                 self.enqueue(conversation_id)
+        if self._benchmark:
+            for conversation_id in await self._benchmark.pending_finalization_ids():
+                self.enqueue(conversation_id)
 
     async def _claim(self, conversation_id: uuid.UUID) -> Conversation | None:
         now = utc_now()
@@ -169,13 +178,30 @@ class ConversationRunner:
             return conversation
 
     async def _run_guarded(self, conversation_id: uuid.UUID) -> None:
-        async with self._slots:
-            await self._run_claimed(conversation_id)
+        try:
+            async with self._slots:
+                await self._run_claimed(conversation_id)
+        finally:
+            # A task can be cancelled before _run_claimed reaches its own cleanup block
+            # (for example, aborting a queued run). Recovery also reaches this path when
+            # _claim rejects an evaluating/cleaning_up conversation after a restart.
+            if self._benchmark and await self._benchmark.should_finalize(conversation_id):
+                try:
+                    await self._benchmark.finalize(conversation_id)
+                except Exception as exc:
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "benchmark_finalization_failed",
+                        conversation_id=str(conversation_id),
+                        error=str(exc),
+                    )
 
     async def _run_claimed(self, conversation_id: uuid.UUID) -> None:
         conversation = await self._claim(conversation_id)
         if conversation is None:
             return
+        is_benchmark = bool(self._benchmark and await self._benchmark.is_benchmark(conversation_id))
         await self._realtime.publish(
             conversation_id,
             "conversation_started",
@@ -197,22 +223,36 @@ class ConversationRunner:
                 str(conversation_id), conversation.task_prompt
             ) as root_observation:
                 with self._tracing.attributes(str(conversation_id)):
+                    if is_benchmark and self._benchmark:
+                        await self._benchmark.prepare(conversation_id)
+                        conversation, _ = await self._load(conversation_id)
                     remaining = max(
                         0.0,
                         (as_utc(conversation.deadline_at) - utc_now()).total_seconds(),
                     )
                     try:
                         async with asyncio.timeout(remaining):
-                            await self._run_loop(conversation_id)
+                            await self._run_loop(conversation_id, is_benchmark=is_benchmark)
                     except TimeoutError:
-                        await self._finish(conversation_id, ConversationStatus.timed_out)
+                        if is_benchmark and self._benchmark:
+                            await self._benchmark.begin_evaluation(
+                                conversation_id,
+                                reason="timeout",
+                                final_status=ConversationStatus.timed_out,
+                            )
+                        else:
+                            await self._finish(conversation_id, ConversationStatus.timed_out)
                 self._tracing.finish_conversation(
                     root_observation, await self._get_status(conversation_id)
                 )
         except asyncio.CancelledError:
             await self._finish_cancelled(conversation_id)
         except Exception as exc:
-            await self._finish_failed(conversation_id, exc)
+            if is_benchmark and self._benchmark:
+                if not await self._benchmark.should_finalize(conversation_id):
+                    await self._benchmark.mark_failure(conversation_id, exc)
+            else:
+                await self._finish_failed(conversation_id, exc)
             log_event(
                 logger,
                 logging.ERROR,
@@ -224,9 +264,14 @@ class ConversationRunner:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
+            if is_benchmark and self._benchmark:
+                if await self._benchmark.should_finalize(conversation_id):
+                    await self._benchmark.finalize(conversation_id)
+                else:
+                    self._benchmark.release(conversation_id)
             await asyncio.to_thread(self._tracing.flush)
 
-    async def _run_loop(self, conversation_id: uuid.UUID) -> None:
+    async def _run_loop(self, conversation_id: uuid.UUID, *, is_benchmark: bool = False) -> None:
         while True:
             state, messages = await self._load(conversation_id)
             if state.status == ConversationStatus.stopping.value:
@@ -235,7 +280,14 @@ class ConversationRunner:
             if state.status != ConversationStatus.running.value:
                 return
             if state.deadline_at and utc_now() >= as_utc(state.deadline_at):
-                await self._finish(conversation_id, ConversationStatus.timed_out)
+                if is_benchmark and self._benchmark:
+                    await self._benchmark.begin_evaluation(
+                        conversation_id,
+                        reason="timeout",
+                        final_status=ConversationStatus.timed_out,
+                    )
+                else:
+                    await self._finish(conversation_id, ConversationStatus.timed_out)
                 return
 
             agent = AgentConfig.model_validate(state.config[state.next_speaker])
@@ -252,6 +304,15 @@ class ConversationRunner:
             )
             if not saved:
                 return
+            if is_benchmark and self._benchmark:
+                should_stop = await self._benchmark.after_turn(
+                    conversation_id,
+                    speaker=state.next_speaker,
+                    content=result.content,
+                    turn_count=state.turn_count + 1,
+                )
+                if should_stop:
+                    return
 
     async def _load(self, conversation_id: uuid.UUID) -> tuple[Conversation, list[Message]]:
         async with self._sessions() as session:
@@ -272,9 +333,7 @@ class ConversationRunner:
         self, state: Conversation, messages: list[Message], agent: AgentConfig
     ) -> tuple[Conversation, list[Message], WorkingContext]:
         context_size = agent.context_size or state.context_size
-        compression_threshold = (
-            agent.compression_threshold or state.compression_threshold
-        )
+        compression_threshold = agent.compression_threshold or state.compression_threshold
         for _ in range(3):
             prompt = build_working_context(
                 system_prompt=agent.system_prompt,
@@ -421,7 +480,7 @@ class ConversationRunner:
         )
 
     async def _generate_turn(
-        self, state: Conversation, agent: AgentConfig, messages: list[dict[str, str]]
+        self, state: Conversation, agent: AgentConfig, messages: list[dict[str, Any]]
     ) -> LLMResult:
         sequence = state.turn_count + 1
         speaker = state.next_speaker
@@ -458,6 +517,39 @@ class ConversationRunner:
                 {"sequence": sequence, "speaker": speaker, "content": content},
             )
 
+        if speaker == "agent_b" and self._benchmark:
+            run = await self._benchmark.get_run(state.id)
+            if run is not None:
+
+                async def complete(
+                    react_messages: list[dict[str, Any]],
+                    tools: list[dict[str, Any]] | None,
+                ) -> LLMResult:
+                    return await self._traced_completion(
+                        name="agent-b-react",
+                        config=agent,
+                        messages=react_messages,
+                        metadata={
+                            "conversation_id": str(state.id),
+                            "speaker": speaker,
+                            "turn": sequence,
+                            "react": True,
+                        },
+                        tools=tools,
+                        tool_choice="auto" if tools else None,
+                    )
+
+                async def execute_terminal(call: ToolCall, ordinal: int) -> dict[str, Any]:
+                    return await self._benchmark.execute_terminal(state.id, sequence, call, ordinal)
+
+                result = await AgentBReactGraph(complete, execute_terminal).run(
+                    messages, max_tool_calls=run.max_tool_calls_per_b_turn
+                )
+                await on_stream_start()
+                if result.content:
+                    await on_token(result.content)
+                return result
+
         return await self._traced_completion(
             name="conversation-turn",
             config=agent,
@@ -476,11 +568,13 @@ class ConversationRunner:
         *,
         name: str,
         config: AgentConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         metadata: dict[str, Any],
         parameter_overrides: dict[str, Any] | None = None,
         on_stream_start: Any | None = None,
         on_token: Any | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResult:
         parameters = config.parameters.to_openai_payload()
         if parameter_overrides:
@@ -493,13 +587,16 @@ class ConversationRunner:
             metadata=metadata,
         ) as observation:
             try:
-                result = await self._llm.complete(
-                    config=config,
-                    messages=messages,
-                    parameter_overrides=parameter_overrides,
-                    on_stream_start=on_stream_start,
-                    on_token=on_token,
-                )
+                completion_kwargs: dict[str, Any] = {
+                    "config": config,
+                    "messages": messages,
+                    "parameter_overrides": parameter_overrides,
+                    "on_stream_start": on_stream_start,
+                    "on_token": on_token,
+                }
+                if tools is not None:
+                    completion_kwargs.update(tools=tools, tool_choice=tool_choice)
+                result = await self._llm.complete(**completion_kwargs)
             except Exception as exc:
                 self._tracing.fail(observation, exc)
                 raise
@@ -647,9 +744,7 @@ class ConversationRunner:
         now = utc_now()
         async with self._sessions() as session, session.begin():
             conversation = await session.scalar(
-                select(Conversation)
-                .where(Conversation.id == conversation_id)
-                .with_for_update()
+                select(Conversation).where(Conversation.id == conversation_id).with_for_update()
             )
             if conversation is None:
                 return
@@ -692,6 +787,11 @@ class ConversationRunner:
             status = await session.scalar(
                 select(Conversation.status).where(Conversation.id == conversation_id)
             )
+        if status in {
+            ConversationStatus.evaluating.value,
+            ConversationStatus.cleaning_up.value,
+        }:
+            return
         if status == ConversationStatus.stopping.value:
             await self._finish(conversation_id, ConversationStatus.stopped)
             return
@@ -727,9 +827,7 @@ class ConversationRunner:
         now = utc_now()
         async with self._sessions() as session, session.begin():
             conversation = await session.scalar(
-                select(Conversation)
-                .where(Conversation.id == conversation_id)
-                .with_for_update()
+                select(Conversation).where(Conversation.id == conversation_id).with_for_update()
             )
             if (
                 conversation is None

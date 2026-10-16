@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     max_concurrent_conversations: int = Field(default=10, ge=1, le=1000)
     shutdown_grace_seconds: float = Field(default=10.0, ge=0)
 
+    vm_master_base_url: str | None = None
+    vm_master_evaluator_token: str | None = None
+    vm_master_sandbox_token: str | None = None
+    vm_master_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    vm_master_job_poll_seconds: float = Field(default=1.0, gt=0, le=30)
+    vm_master_job_timeout_seconds: float = Field(default=1_200.0, gt=0, le=14_400)
+
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_base_url: str | None = None

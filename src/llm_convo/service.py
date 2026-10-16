@@ -37,9 +37,7 @@ class ConversationService:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = session_factory
 
-    async def create(
-        self, request: StartConversationRequest, idempotency_key: str
-    ) -> CreateResult:
+    async def create(self, request: StartConversationRequest, idempotency_key: str) -> CreateResult:
         fingerprint = request_fingerprint(request)
         async with self._sessions() as session:
             existing = await self._by_idempotency_key(session, idempotency_key)
@@ -116,9 +114,7 @@ class ConversationService:
     async def request_stop(self, conversation_id: uuid.UUID) -> Conversation | None:
         async with self._sessions() as session, session.begin():
             conversation = await session.scalar(
-                select(Conversation)
-                .where(Conversation.id == conversation_id)
-                .with_for_update()
+                select(Conversation).where(Conversation.id == conversation_id).with_for_update()
             )
             if conversation is None:
                 return None

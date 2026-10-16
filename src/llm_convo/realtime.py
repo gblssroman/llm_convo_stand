@@ -28,9 +28,7 @@ class RealtimeBroker:
         self._subscribers: dict[uuid.UUID, set[asyncio.Queue[RealtimeEvent]]] = defaultdict(set)
         self._queue_size = queue_size
 
-    async def publish(
-        self, conversation_id: uuid.UUID, event: str, data: dict[str, Any]
-    ) -> None:
+    async def publish(self, conversation_id: uuid.UUID, event: str, data: dict[str, Any]) -> None:
         item = RealtimeEvent(
             id=uuid.uuid4().hex,
             event=event,

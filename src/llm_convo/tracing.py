@@ -121,9 +121,7 @@ class Tracing:
             log_event(logger, logging.WARNING, "langfuse_query_failed", error=str(exc))
             return [], str(exc)
 
-    def conversation(
-        self, conversation_id: str, task_prompt: str
-    ) -> AbstractContextManager[Any]:
+    def conversation(self, conversation_id: str, task_prompt: str) -> AbstractContextManager[Any]:
         if not self._client:
             return nullcontext(None)
         try:

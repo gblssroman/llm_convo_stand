@@ -70,6 +70,8 @@ class AgentConfig(BaseModel):
             "frequency_penalty",
             "presence_penalty",
             "seed",
+            "tools",
+            "tool_choice",
         }
         overlap = reserved.intersection(value)
         if overlap:
@@ -101,9 +103,7 @@ class StartConversationRequest(BaseModel):
     def validate_initial_prompt_budget(self) -> "StartConversationRequest":
         for name, agent in (("agent_a", self.agent_a), ("agent_b", self.agent_b)):
             context_size = agent.context_size or self.context_size
-            compression_threshold = (
-                agent.compression_threshold or self.compression_threshold
-            )
+            compression_threshold = agent.compression_threshold or self.compression_threshold
             initial_tokens = (
                 estimate_tokens(self.task_prompt)
                 + estimate_tokens(agent.system_prompt)
@@ -245,3 +245,89 @@ class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     database: Literal["ok", "error"]
     langfuse: Literal["ok", "error", "configured", "disabled"]
+
+
+class VmScenarioSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    title: str
+    category: str
+    mode: Literal["agent", "escape"]
+
+
+class VmScenario(VmScenarioSummary):
+    prompt: str
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class StartBenchmarkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    agent_a: AgentConfig
+    agent_b: AgentConfig
+    summarizer: AgentConfig | None = None
+    context_size: int = Field(default=32768, ge=1024)
+    compression_threshold: float = Field(default=0.9, ge=0.5, le=0.98)
+    retain_recent_messages: int = Field(default=4, ge=2, le=100)
+    timeout_seconds: int = Field(default=3600, ge=1, le=86_400)
+    max_tool_calls_per_b_turn: int = Field(default=5, ge=1, le=100)
+    max_rounds: int = Field(default=40, ge=1, le=200)
+
+    def conversation_request(self, task_prompt: str) -> StartConversationRequest:
+        return StartConversationRequest(
+            task_prompt=task_prompt,
+            agent_a=self.agent_a,
+            agent_b=self.agent_b,
+            summarizer=self.summarizer,
+            context_size=self.context_size,
+            compression_threshold=self.compression_threshold,
+            retain_recent_messages=self.retain_recent_messages,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+
+class ToolExecutionView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    message_sequence: int
+    ordinal: int
+    tool_call_id: str
+    name: str
+    arguments: dict[str, Any]
+    status: str
+    result: dict[str, Any] | None
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class BenchmarkRunView(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    conversation_id: uuid.UUID
+    scenario_id: str
+    scenario_mode: Literal["agent", "escape"]
+    scenario: dict[str, Any]
+    stage: str
+    max_tool_calls_per_b_turn: int
+    max_rounds: int
+    completion_reason: str | None
+    cleanup_required: bool
+    verdict: dict[str, Any] | None
+    submit_result: dict[str, Any] | None
+    error: str | None
+    cleanup_error: str | None
+    created_at: datetime
+    updated_at: datetime
+    ended_at: datetime | None
+    tool_executions: list[ToolExecutionView] = Field(default_factory=list)
+
+
+class VmMasterHealthResponse(BaseModel):
+    configured: bool
+    status: Literal["ok", "error", "disabled"]
+    error: str | None = None

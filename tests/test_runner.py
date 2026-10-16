@@ -34,8 +34,10 @@ class FakeLLM:
         self.calls += 1
         self.requests.append([item.copy() for item in messages])
         is_summary = messages[0]["content"].startswith("You compress")
-        content = "compact summary" if is_summary else f"turn {self.calls} " + (
-            "x" * 300 if self.large_turns else "ok"
+        content = (
+            "compact summary"
+            if is_summary
+            else f"turn {self.calls} " + ("x" * 300 if self.large_turns else "ok")
         )
         if on_stream_start:
             await on_stream_start()
@@ -91,9 +93,7 @@ def start_request(*, timeout_seconds: int = 10, context_size: int = 32768):
 async def test_runner_alternates_and_preserves_full_transcript(database) -> None:
     service = ConversationService(database)
     created = await service.create(start_request(), "runner-alternates")
-    runner = ConversationRunner(
-        database, FakeLLM(), Tracing(), poll_seconds=1, heartbeat_seconds=5
-    )
+    runner = ConversationRunner(database, FakeLLM(), Tracing(), poll_seconds=1, heartbeat_seconds=5)
     runner.enqueue(created.conversation.id)
 
     async def has_four_turns() -> bool:
@@ -142,9 +142,7 @@ async def test_runner_sends_role_aware_history_and_keeps_system_prompts_private(
     )
     created = await service.create(request, "runner-role-aware-history")
     llm = FakeLLM()
-    runner = ConversationRunner(
-        database, llm, Tracing(), poll_seconds=1, heartbeat_seconds=5
-    )
+    runner = ConversationRunner(database, llm, Tracing(), poll_seconds=1, heartbeat_seconds=5)
     runner.enqueue(created.conversation.id)
 
     async def has_four_turns() -> bool:
@@ -186,9 +184,7 @@ async def test_runner_sends_role_aware_history_and_keeps_system_prompts_private(
 @pytest.mark.asyncio
 async def test_runner_enforces_hard_timeout_during_model_call(database) -> None:
     service = ConversationService(database)
-    created = await service.create(
-        start_request(timeout_seconds=1), "runner-hard-timeout"
-    )
+    created = await service.create(start_request(timeout_seconds=1), "runner-hard-timeout")
     runner = ConversationRunner(
         database, FakeLLM(delay=5), Tracing(), poll_seconds=1, heartbeat_seconds=5
     )
@@ -205,9 +201,7 @@ async def test_runner_enforces_hard_timeout_during_model_call(database) -> None:
 @pytest.mark.asyncio
 async def test_compression_keeps_full_messages_and_creates_snapshot(database) -> None:
     service = ConversationService(database)
-    created = await service.create(
-        start_request(context_size=1024), "runner-compression"
-    )
+    created = await service.create(start_request(context_size=1024), "runner-compression")
     runner = ConversationRunner(
         database,
         FakeLLM(large_turns=True),
@@ -234,9 +228,7 @@ async def test_compression_keeps_full_messages_and_creates_snapshot(database) ->
     async with database() as session:
         conversation = await session.get(Conversation, created.conversation.id)
         message_count = await session.scalar(
-            select(func.count(Message.id)).where(
-                Message.conversation_id == created.conversation.id
-            )
+            select(func.count(Message.id)).where(Message.conversation_id == created.conversation.id)
         )
         snapshot_count = await session.scalar(
             select(func.count(ContextSnapshot.id)).where(
